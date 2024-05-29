@@ -3,7 +3,6 @@ package manager
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"reflect"
 
@@ -18,10 +17,12 @@ import (
 	acmclusterv1beta2 "open-cluster-management.io/api/cluster/v1beta2"
 	acmconfigpolicyv1 "open-cluster-management.io/config-policy-controller/api/v1"
 	acmpolicyv1 "open-cluster-management.io/governance-policy-propagator/api/v1"
+
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -111,9 +112,29 @@ func (r *HubClusterSecretReconciler) Reconcile(ctx context.Context, req reconcil
 	err := r.Get(ctx, req.NamespacedName, secret)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			// Request object not found, could have been deleted after reconcile request.
-			// Return and don't requeue
-			r.Logger.Info("Secret not found. Ignoring object may have been deleted while reconciling")
+			// Request object not found, probably a deletion event...
+			r.Logger.Info("Secret not found. Checking if we had it in the policy, otherwise ignore")
+			// Check if there is a policy that exists with name certsync-<namespace>
+			policyExists, policyObjectFound, err := r.policyExists(ctx, "certsync-"+req.Namespace, policiesNamespace)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+			if policyExists {
+
+				// Check if the deleted secret was defined in the policy and remove it from it
+				policyModified, err := r.removeObjectTemplateFromPolicyTemplate(policyObjectFound.Spec.PolicyTemplates[0], req.Name, req.Namespace)
+				if err != nil {
+					return reconcile.Result{}, err
+				}
+				if policyModified {
+					err = r.Update(ctx, policyObjectFound)
+					if err != nil {
+						return reconcile.Result{}, err
+					}
+					r.Logger.Info("Secret removed from the policy")
+					return reconcile.Result{}, nil
+				}
+			}
 			return reconcile.Result{}, nil
 		}
 		return reconcile.Result{}, err
@@ -149,7 +170,7 @@ func (r *HubClusterSecretReconciler) Reconcile(ctx context.Context, req reconcil
 			if err != nil {
 				return reconcile.Result{}, err
 			}
-			//TODO: Create a PlacementBinding for the policy if it doesn't exist, then add the policy to the binding
+			//Create a PlacementBinding for the policy if it doesn't exist, then add the policy to the binding
 			err = r.placementBindingForClusterAndPolicy(ctx, managedClusterName, policiesNamespace, policyObjectName)
 			if err != nil {
 				return reconcile.Result{}, err
@@ -370,6 +391,71 @@ func (r *HubClusterSecretReconciler) addOrUpdateObjectTemplateToPolicyTemplate(p
 	return nil
 }
 
+func (r *HubClusterSecretReconciler) removeObjectTemplateFromPolicyTemplate(policyTemplate *acmpolicyv1.PolicyTemplate, secretName string, secretNamespace string) (bool, error) {
+	r.Logger.Info("Checking if policy template has the required object templates")
+	policyTemplateModified := false
+	configurationPolicy := &acmconfigpolicyv1.ConfigurationPolicy{}
+	err := json.Unmarshal(policyTemplate.ObjectDefinition.Raw, &configurationPolicy)
+	if err != nil {
+		return policyTemplateModified, err
+	}
+
+	objReceivedKind := "Secret"
+	objReceivedName := secretName
+	objReceivedNamespace := secretNamespace
+
+	if len(configurationPolicy.Spec.ObjectTemplates) > 0 {
+		r.Logger.Info("Checking if PolicyTemplate had the deleted secret defined")
+		objectFound := false
+		for index, obj := range configurationPolicy.Spec.ObjectTemplates {
+			genericObjFound := make(map[string]interface{})
+			err := json.Unmarshal(obj.ObjectDefinition.Raw, &genericObjFound)
+			if err != nil {
+				return policyTemplateModified, err
+			}
+			objFoundKind := genericObjFound["kind"].(string)
+			objFoundMetadata := genericObjFound["metadata"].(map[string]interface{})
+			objFoundName := objFoundMetadata["name"].(string)
+			objFoundNamespace := objFoundMetadata["namespace"].(string)
+
+			if objReceivedKind == objFoundKind && objReceivedName == objFoundName && objReceivedNamespace == objFoundNamespace {
+				objectFound = true
+				r.Logger.Info("Matching object found, removing existing object from template")
+				// Remove object
+				configurationPolicy.Spec.ObjectTemplates = append(configurationPolicy.Spec.ObjectTemplates[:index], configurationPolicy.Spec.ObjectTemplates[index+1:]...)
+				policyTemplateModified = true
+				break
+			}
+		}
+		// Object was not part of the templates, no need to remove anything
+		if !objectFound {
+			r.Logger.Info("No matching object found, no need to update the policy")
+		}
+		rawConfigurationPolicy, err := json.Marshal(configurationPolicy)
+		if err != nil {
+			return policyTemplateModified, err
+		}
+		rawExtension := runtime.RawExtension{
+			Raw: rawConfigurationPolicy,
+		}
+		policyTemplate.ObjectDefinition = rawExtension
+	}
+
+	return policyTemplateModified, nil
+}
+
+func (r *HubClusterSecretReconciler) policyExists(ctx context.Context, policyName string, policyNamespace string) (bool, *acmpolicyv1.Policy, error) {
+	policyObjectFound := &acmpolicyv1.Policy{}
+	err := r.Get(ctx, client.ObjectKey{Name: policyName, Namespace: policyNamespace}, policyObjectFound)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil, nil
+		}
+		return false, nil, err
+	}
+	return true, policyObjectFound, nil
+}
+
 func (r *HubClusterSecretReconciler) policyForSecret(ctx context.Context, secretObject *corev1.Secret, policyNamespace string) (string, error) {
 	// Cleanup secret
 	policySecret := &corev1.Secret{}
@@ -385,56 +471,60 @@ func (r *HubClusterSecretReconciler) policyForSecret(ctx context.Context, secret
 
 	// Check if policy already exists
 	policyName := "certsync-" + secretObject.Namespace
-	policyObjectFound := &acmpolicyv1.Policy{}
-	err := r.Get(ctx, client.ObjectKey{Name: policyName, Namespace: policyNamespace}, policyObjectFound)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			r.Logger.Info("Policy " + policyName + " not found in namespace " + policyNamespace + ". Creating it...")
 
-			//Move stuff here
-			policyObject := &acmpolicyv1.Policy{}
-			r.Logger.Info("About to fill policy for secret " + secretObject.Name)
-			policyObject.TypeMeta = metav1.TypeMeta{
-				APIVersion: "policy.open-cluster-management.io/v1",
-				Kind:       "Policy",
-			}
-			policyObject.Name = policyName
-			policyObject.Namespace = policyNamespace
-			policyObject.Spec.RemediationAction = remediationInform
-			policyObject.Spec.Disabled = false
-			// Get objectTemplate for Secret
-			secretObjectTemplate, err := objectTemplateForPolicyTemplate(policySecret)
-			if err != nil {
-				r.Logger.Error(err, "Failed to get a objectTemplate for the policyTemplate")
-				return policyName, err
-			}
-			// We need to send the objectTemplate to the policyTemplate and check if it already exists
-			policyTemplate, err := policyTemplateForPolicy(secretObject.Name)
-			if err != nil {
-				r.Logger.Error(err, "Failed to get a policyTemplate for the policy")
-				return policyName, err
-			}
-			r.addOrUpdateObjectTemplateToPolicyTemplate(policyTemplate, secretObjectTemplate)
-			if err != nil {
-				r.Logger.Error(err, "Failed to get add objectTemplate for the secret")
-				return policyName, err
-			}
-			policyObject.Spec.PolicyTemplates = []*acmpolicyv1.PolicyTemplate{policyTemplate}
-			err = r.Create(ctx, policyObject)
-			if err != nil {
-				return policyName, err
-			}
-			r.Logger.Info("Policy " + policyName + " has been created")
-			return policyName, nil
-		} else {
+	policyExists, policyObjectFound, err := r.policyExists(ctx, policyName, policyNamespace)
+	if err != nil {
+		return policyName, err
+	}
+	if !policyExists {
+		r.Logger.Info("Policy " + policyName + " not found in namespace " + policyNamespace + ". Creating it...")
+		policyObject := &acmpolicyv1.Policy{}
+		r.Logger.Info("About to fill policy for secret " + secretObject.Name)
+		policyObject.TypeMeta = metav1.TypeMeta{
+			APIVersion: "policy.open-cluster-management.io/v1",
+			Kind:       "Policy",
+		}
+		policyObject.Name = policyName
+		policyObject.Namespace = policyNamespace
+		policyObject.Spec.RemediationAction = remediationInform
+		policyObject.Spec.Disabled = false
+		// Get objectTemplate for Secret
+		secretObjectTemplate, err := objectTemplateForPolicyTemplate(policySecret)
+		if err != nil {
+			r.Logger.Error(err, "Failed to get a objectTemplate for the policyTemplate")
 			return policyName, err
 		}
+		// We need to send the objectTemplate to the policyTemplate and check if it already exists
+		policyTemplate, err := policyTemplateForPolicy(secretObject.Name)
+		if err != nil {
+			r.Logger.Error(err, "Failed to get a policyTemplate for the policy")
+			return policyName, err
+		}
+		r.addOrUpdateObjectTemplateToPolicyTemplate(policyTemplate, secretObjectTemplate)
+		if err != nil {
+			r.Logger.Error(err, "Failed to get add objectTemplate for the secret")
+			return policyName, err
+		}
+		policyObject.Spec.PolicyTemplates = []*acmpolicyv1.PolicyTemplate{policyTemplate}
+		err = r.Create(ctx, policyObject)
+		if err != nil {
+			return policyName, err
+		}
+		r.Logger.Info("Policy " + policyName + " has been created")
+		return policyName, nil
 	}
 
 	// Policy already exist, we may want to update it
 	r.Logger.Info("Policy " + policyName + " found in namespace " + policyNamespace + ". Checking if it needs to be updated...")
 
-	updatedPolicy := policyObjectFound
+	// If we do this, we're copying underlying data thru pointers
+	//updatedPolicy := policyObjectFound
+	// Create a copy of the current policy found, we will update this copy and compare it at the end of the process
+	updatedPolicy, err := deepCopyPolicy(policyObjectFound)
+	if err != nil {
+		return policyName, err
+	}
+
 	// Get objectTemplate for Secret
 	secretObjectTemplate, err := objectTemplateForPolicyTemplate(policySecret)
 	if err != nil {
@@ -444,17 +534,8 @@ func (r *HubClusterSecretReconciler) policyForSecret(ctx context.Context, secret
 	// Get PolicyTemplate
 	r.addOrUpdateObjectTemplateToPolicyTemplate(updatedPolicy.Spec.PolicyTemplates[0], secretObjectTemplate)
 
-	// Start Patch: Below deepequal is not working, will check later, for now let's run the update anyway
-	//policyObjectFound.Spec.PolicyTemplates = updatedPolicy.Spec.PolicyTemplates
-	//err = r.Update(ctx, policyObjectFound)
-	if err != nil {
-		return policyName, err
-	}
-	// End Patch
-	// TODO: Check what can be compared?
-	if !reflect.DeepEqual(policyObjectFound.Spec, updatedPolicy.Spec) {
+	if !reflect.DeepEqual(policyObjectFound.Spec.PolicyTemplates, updatedPolicy.Spec.PolicyTemplates) {
 		// Get existing policy with policyTemplates and get them updated
-		fmt.Println("HEREEEEEEEEEEE")
 		r.Logger.Info("Policy " + policyName + " needs to be updated")
 		policyObjectFound.Spec.PolicyTemplates = updatedPolicy.Spec.PolicyTemplates
 		err = r.Update(ctx, policyObjectFound)
@@ -466,6 +547,24 @@ func (r *HubClusterSecretReconciler) policyForSecret(ctx context.Context, secret
 		r.Logger.Info("Policy " + policyName + " is up to date")
 	}
 	return policyName, nil
+}
+
+func (r *HubClusterSecretReconciler) policyHasSecret(ctx context.Context, secretName string, secretNamespace string) (bool, error) {
+	return false, nil
+}
+
+func deepCopyPolicy(inputPolicy *acmpolicyv1.Policy) (*acmpolicyv1.Policy, error) {
+	bytes, err := json.Marshal(inputPolicy)
+	if err != nil {
+		return nil, err
+	}
+	copy := &acmpolicyv1.Policy{}
+	err = json.Unmarshal(bytes, copy)
+	if err != nil {
+		return nil, err
+	}
+
+	return copy, nil
 }
 
 func policyTemplateForPolicy(policyTemplateName string) (*acmpolicyv1.PolicyTemplate, error) {
